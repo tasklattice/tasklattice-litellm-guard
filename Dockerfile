@@ -46,7 +46,12 @@ USER root
 ENV PYTHONPATH=/app \
     LITELLM_LOCAL_MODEL_COST_MAP=True
 COPY --from=tasklattice-litellm-builder /app/litellm /app/litellm
-RUN apk add --no-cache ca-certificates libatomic \
+# The Wolfi base already ships ca-certificates-bundle. Installing the separate
+# ca-certificates package from the rolling repository pulls a newer OpenSSL
+# whose libcrypto conflicts with the base's openssl.cnf, so add only what is
+# missing (libatomic, required by the Prisma engine).
+RUN test -s /etc/ssl/certs/ca-certificates.crt \
+    && apk add --no-cache libatomic \
     && chown -R 65532:65532 /app/.venv/lib/python3.13/site-packages/prisma \
     && python -c 'import json; from importlib.resources import files; cost_map = json.loads(files("litellm").joinpath("model_prices_and_context_window_backup.json").read_text(encoding="utf-8")); assert len(cost_map) > 1000, "LiteLLM bundled model cost map is missing or incomplete"'
 
