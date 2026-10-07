@@ -46,6 +46,14 @@ def _dict(value: Any) -> dict:
     raise _failure("Unsupported model stream frame; no unchecked content was released.")
 
 
+def _empty_choice(choice: Any) -> bool:
+    """A choice that carries neither content, another channel, nor a completion."""
+    choice = _dict(choice)
+    delta = _dict(choice.get("delta", {}))
+    return choice.get("index", 0) == 0 and choice.get("finish_reason") is None and all(
+        value in (None, "", [], {}) for key, value in delta.items() if key != "role")
+
+
 def _verified_completion(response: Any, depth: int = 0) -> bool:
     """Distinguish upstream completion from LiteLLM's synthetic EOF stop.
 
@@ -192,7 +200,12 @@ async def _protected_output_stream(provider, response, request_data, user_api_ke
                         elif identity != current:
                             raise _failure("Model stream identity changed before completion.")
                         choices = data.get("choices")
-                        if choices == [] and data.get("usage") is not None:
+                        # With stream_options.include_usage, providers send usage as
+                        # choices=[], but LiteLLM's stream wrapper re-emits it with one
+                        # empty choice (no content, no finish_reason). Both are usage
+                        # only; any text or completion marker still goes through checks.
+                        if data.get("usage") is not None and (choices == [] or (
+                            isinstance(choices, list) and len(choices) == 1 and _empty_choice(choices[0]))):
                             usage = {key: value for key, value in _dict(data["usage"]).items()
                                 if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
                                 and type(value) is int and value >= 0}

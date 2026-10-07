@@ -424,6 +424,25 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result[0].id, "chat-test")
 
 
+    async def test_include_usage_frame_with_one_empty_choice_is_usage_only(self):
+        # LiteLLM 1.87.0 re-emits stream_options.include_usage as one empty
+        # choice plus usage after the finish frame, not as choices=[].
+        trailing = ModelResponseStream(id="chat-test", created=123, model="test-model",
+            choices=[{"index": 0, "delta": {}, "finish_reason": None}], usage={"total_tokens": 7})
+        result = await self.collect(Upstream([chunk("safe"), chunk(finish="stop"), trailing]))
+        self.assertEqual(self.content(result), "safe")
+        self.assertEqual(result[-1].usage.total_tokens, 7)
+        self.assertEqual(sum(1 for event in self.received if event["type"] == "end"), 1)
+
+
+    async def test_usage_frame_cannot_carry_text_past_the_checks(self):
+        trailing = ModelResponseStream(id="chat-test", created=123, model="test-model",
+            choices=[{"index": 0, "delta": {"content": "late unchecked text"}, "finish_reason": None}], usage={"total_tokens": 7})
+        with self.assertRaises(APIError):
+            await self.collect(Upstream([chunk("safe"), chunk(finish="stop"), trailing]))
+        self.assertNotIn("late unchecked text", str(self.sent))
+
+
     async def test_disabled_output_does_not_change_other_stage_selection(self):
         self.provider.should_run_guardrail.return_value = False
         original = [chunk("unprotected by explicit configuration"), chunk(finish="stop")]
