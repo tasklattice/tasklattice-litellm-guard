@@ -1,0 +1,101 @@
+name: Release image
+
+on:
+  push:
+    tags:
+      - "v*-guard.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  DOCKER_BUILD_SUMMARY: "false"
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      litellm_version: ${{ steps.tag.outputs.litellm_version }}
+      provider_version: ${{ steps.tag.outputs.provider_version }}
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: tag
+        run: bash scripts/check-release-tag.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+  publish-platforms:
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite a published release
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tali-litellm:${{ needs.validate.outputs.image_tag }}"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "Refusing to overwrite $image; publish a new -guard.N tag instead." >&2
+            exit 1
+          fi
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/${{ matrix.architecture }}
+          pull: true
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/tali-litellm:${{ needs.validate.outputs.image_tag }}-${{ matrix.architecture }}
+          build-args: |
+            LITELLM_VERSION=${{ needs.validate.outputs.litellm_version }}
+            PROVIDER_VERSION=${{ needs.validate.outputs.provider_version }}
+            SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=release-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.architecture }}
+          provenance: mode=max
+          sbom: true
+
+  publish-manifest:
+    needs: [validate, publish-platforms]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multi-architecture manifest
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tali-litellm"
+          tag="${{ needs.validate.outputs.image_tag }}"
+          docker buildx imagetools create --tag "${image}:${tag}" "${image}:${tag}-amd64" "${image}:${tag}-arm64"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Image: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tali-litellm:${{ needs.validate.outputs.image_tag }}\` (LiteLLM ${{ needs.validate.outputs.litellm_version }}, TaskLattice Guard output-stream protocol 1)."

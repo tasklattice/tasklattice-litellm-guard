@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  overlay:
+    name: Apply, verify and test overlay (LiteLLM ${{ matrix.litellm }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # One entry per reviewed litellm/v<version> directory.
+        litellm: ["1.87.0"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Release tag validator
+        run: |
+          bash scripts/check-release-tag.sh "v${{ matrix.litellm }}-guard.1"
+          ! bash scripts/check-release-tag.sh "v9.9.9-guard.1" 2>/dev/null
+          ! bash scripts/check-release-tag.sh "v${{ matrix.litellm }}" 2>/dev/null
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      # The builder stage applies the overlay to the pinned upstream tree,
+      # verifies it, and runs the Provider unit tests (tests/test_streaming.py).
+      - name: Build and verify overlay
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: tasklattice-litellm-builder
+          build-args: LITELLM_VERSION=${{ matrix.litellm }}
+          push: false
+          cache-from: type=gha,scope=builder-${{ matrix.litellm }}
+          cache-to: type=gha,mode=max,scope=builder-${{ matrix.litellm }}
