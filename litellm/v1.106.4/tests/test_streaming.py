@@ -1,5 +1,6 @@
 """Run inside the pinned LiteLLM image; actual loopback WebSocket peer and real LiteLLM wrappers."""
 import asyncio
+import anyio
 import datetime
 import unittest
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from litellm.proxy.guardrails.guardrail_hooks.tasklattice_guard import streaming
 from litellm.proxy.guardrails.guardrail_hooks.tasklattice_guard.tasklattice_guard import TaskLatticeGuard
 from litellm.types.utils import ModelResponseStream
 from litellm.router import Router
+from litellm.proxy.utils import _UpstreamStreamBoundary
 
 
 def chunk(text="", finish=None, **delta):
@@ -321,6 +323,8 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                     source.created = 123  # Match the fixture's wire timestamp, including synthetic frames.
                     wrapped = await Router._acompletion_streaming_iterator(SimpleNamespace(), source,
                         self.data["messages"], {}) if with_router else source
+                    # The real proxy adds this boundary before invoking us.
+                    wrapped = _UpstreamStreamBoundary(wrapped)
                     if complete:
                         self.assertEqual(self.content(await self.collect(wrapped)), "safe")
                         self.assertEqual(self.received[-1]["type"], "end")
@@ -425,7 +429,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_include_usage_frame_with_one_empty_choice_is_usage_only(self):
-        # LiteLLM 1.87.0 re-emits stream_options.include_usage as one empty
+        # LiteLLM 1.106.4 re-emits stream_options.include_usage as one empty
         # choice plus usage after the finish frame, not as choices=[].
         trailing = ModelResponseStream(id="chat-test", created=123, model="test-model",
             choices=[{"index": 0, "delta": {}, "finish_reason": None}], usage={"total_tokens": 7})
@@ -475,4 +479,30 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
             await self.collect(upstream)
         self.assertEqual(caught.exception.status_code, 400)
         self.assertEqual(upstream.consumed, 0)
+        self.assertTrue(upstream.closed)
+
+    async def test_cancel_before_router_first_read_closes_acquired_connection(self):
+        logging = Logging(model="test-model", messages=self.data["messages"], stream=True,
+            call_type="acompletion", start_time=datetime.datetime.now(),
+            litellm_call_id="call-1", function_id="test")
+        logging._on_deferred_stream_complete = Mock()
+        upstream = Upstream([])
+        source = CustomStreamWrapper(completion_stream=upstream, model="test-model",
+            custom_llm_provider="openai", logging_obj=logging)
+        wrapped = await Router._acompletion_streaming_iterator(SimpleNamespace(), source,
+            self.data["messages"], {})
+        stream = self.provider.async_post_call_streaming_iterator_hook(
+            None, _UpstreamStreamBoundary(wrapped), self.data)
+        await anext(stream)  # Empty role frame, no upstream read yet.
+        self.assertEqual(upstream.consumed, 0)
+        await stream.aclose()
+        self.assertTrue(upstream.closed)
+
+    async def test_cancelled_anyio_scope_still_closes_upstream(self):
+        upstream = Upstream([])
+        stream = self.provider.async_post_call_streaming_iterator_hook(None, upstream, self.data)
+        await anext(stream)
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
         self.assertTrue(upstream.closed)

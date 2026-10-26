@@ -46,7 +46,13 @@ class TaskLatticeGuard(GenericGuardrailAPI):
         # a missing credential still fails closed at request time, while normal
         # startup and rotations require no guardrail re-registration.
         kwargs.pop("api_key", None)
-        super().__init__(api_key=None, **kwargs)
+        # 1.106.4 consumes fail_on_error and passes timeout on each HTTP call.
+        # Keep policy blocks/invalid responses closed even with fail_open for
+        # transport outages, and do not let the per-call default disable timeout.
+        kwargs.pop("fail_on_error", None)
+        kwargs.pop("timeout", None)
+        super().__init__(api_key=None, fail_on_error=True,
+                         timeout=float(timeout_seconds), **kwargs)
         # GenericGuardrailAPI uses the shared GuardrailCallback client by
         # default. Give TaskLattice a separately cached client so this setting
         # is enforced for every callback without changing other providers.

@@ -1,25 +1,37 @@
 # LiteLLM with the TaskLattice Guard Guardrail Provider.
-#
-# Each supported LiteLLM release has its own reviewed overlay directory under
-# litellm/v<version>. The upstream image tag and the overlay directory must
-# name the same release; apply-overlay.py refuses an unexpected source tree.
-ARG LITELLM_VERSION=1.87.0
-ARG LITELLM_IMAGE=litellm/litellm-database:v${LITELLM_VERSION}
+ARG LITELLM_VERSION=1.106.4
+ARG LITELLM_IMAGE=ghcr.io/berriai/litellm-database:v${LITELLM_VERSION}@sha256:db36453d25e76c9eb689d7d51b8e5fa48843243d7a86ed1284cf574ce0107b3f
+ARG UI_BUILD_IMAGE=node:24.19-alpine3.24@sha256:d32cdf619f63fe0471182d08996dd516c6275bb5fd31ae06e55a570bd9e1ad43
+
+FROM ${UI_BUILD_IMAGE} AS tasklattice-litellm-ui
+ARG LITELLM_VERSION
+RUN apk add --no-cache python3
+WORKDIR /app
+# Upstream's runtime image no longer includes the UI source. The matching
+# release source is used only in this build stage and never enters the runtime.
+ADD --checksum=sha256:dc58da933f25e8efec12348a4821b71e15e358d97093821576073fee37c49589 https://codeload.github.com/BerriAI/litellm/tar.gz/refs/tags/v${LITELLM_VERSION} /tmp/upstream.tar.gz
+RUN tar -xzf /tmp/upstream.tar.gz --strip-components=1 -C /app && rm /tmp/upstream.tar.gz
+RUN --mount=type=cache,target=/root/.npm \
+    cd /app/ui/litellm-dashboard && npm ci --ignore-scripts --no-audit --no-fund
+COPY litellm/v${LITELLM_VERSION} /tmp/tasklattice-litellm-overlay
+ENV TASKLATTICE_LITELLM_SOURCE_VERSION=${LITELLM_VERSION} \
+    NEXT_TELEMETRY_DISABLED=1
+RUN python3 /tmp/tasklattice-litellm-overlay/apply-overlay.py --root /app \
+    && python3 /tmp/tasklattice-litellm-overlay/verify-overlay.py --root /app --files-only
+RUN cd /app/ui/litellm-dashboard && npm run build
 
 FROM ${LITELLM_IMAGE} AS tasklattice-litellm-builder
 ARG LITELLM_VERSION
-
 USER root
+COPY --from=tasklattice-litellm-ui /app/litellm /app/litellm
+COPY --from=tasklattice-litellm-ui /app/ui/litellm-dashboard/src /app/ui/litellm-dashboard/src
 COPY litellm/v${LITELLM_VERSION} /tmp/tasklattice-litellm-overlay
-RUN python /tmp/tasklattice-litellm-overlay/apply-overlay.py --root /app \
-    && python /tmp/tasklattice-litellm-overlay/verify-overlay.py --root /app \
-    && LITELLM_LOCAL_MODEL_COST_MAP=True PYTHONPATH=/app python -m unittest discover -s /tmp/tasklattice-litellm-overlay/tests \
-    && cd /app/ui/litellm-dashboard \
-    && npm ci --ignore-scripts \
-    && npm run build \
-    && rm -rf /app/litellm/proxy/_experimental/out \
-    && mkdir -p /app/litellm/proxy/_experimental/out \
-    && cp -R out/. /app/litellm/proxy/_experimental/out/
+RUN LITELLM_LOCAL_MODEL_COST_MAP=True PYTHONPATH=/app \
+    python /tmp/tasklattice-litellm-overlay/verify-overlay.py --root /app \
+    && LITELLM_LOCAL_MODEL_COST_MAP=True PYTHONPATH=/app \
+    python -m unittest discover -s /tmp/tasklattice-litellm-overlay/tests \
+    && rm -rf /app/litellm/proxy/_experimental/out
+COPY --from=tasklattice-litellm-ui /app/ui/litellm-dashboard/out /app/litellm/proxy/_experimental/out
 
 FROM ${LITELLM_IMAGE}
 ARG LITELLM_VERSION

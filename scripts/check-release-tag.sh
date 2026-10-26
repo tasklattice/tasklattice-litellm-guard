@@ -4,7 +4,7 @@ set -euo pipefail
 
 tag=${1:?Usage: check-release-tag.sh v<litellm-version>-guard.<n>}
 if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-guard\.([1-9][0-9]*)$ ]]; then
-  echo "Release tag must look like v1.87.0-guard.1, got: $tag" >&2
+  echo "Release tag must look like v1.106.4-guard.1, got: $tag" >&2
   exit 2
 fi
 litellm_version=${BASH_REMATCH[1]}

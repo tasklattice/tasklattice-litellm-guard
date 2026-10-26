@@ -1,4 +1,4 @@
-# TaskLattice Guard overlay for LiteLLM v1.87.0
+# TaskLattice Guard overlay for LiteLLM v1.106.4
 
 This version-locked overlay adds `tasklattice_guard` as a first-class LiteLLM
 Guardrail Provider. The runtime reuses LiteLLM's Generic Guardrail API protocol.
@@ -35,9 +35,10 @@ Editing policy settings does not require entering the secret again. Changing
 the endpoint does require the secret again so that the new pair can be verified;
 the existing credential remains unchanged for all other edits.
 
-`fail_on_error` is intentionally not stored or exposed. LiteLLM v1.87.0's
-Generic Guardrail API does not consume it, so presenting it would create a
-configuration control with no runtime effect.
+`fail_on_error` is intentionally not stored or exposed. The Provider fixes it
+at `true`: only the documented `unreachable_fallback` transport-outage policy
+may bypass a non-streaming check. LiteLLM's per-request HTTP timeout is explicitly
+set from `timeout_seconds`.
 
 ## Protected Output streaming
 
@@ -87,9 +88,12 @@ Disconnect cancels the Runner check; no output buffer is stored in Redis.
 
 LiteLLM can synthesize a `stop` frame when an upstream iterator ends without a
 completion marker. The Provider checks actual completion evidence before final
-release. In pinned 1.87.0, Router's `FallbackStreamWrapper` holds its active
+release. In pinned 1.106.4, Router's `FallbackStreamWrapper` holds its active
 source inside a suspended generator; the TaskLattice compatibility helper
-inspects only that known wrapper and fails closed if its layout changes. Tests
+unwraps the proxy's `_UpstreamStreamBoundary`, then inspects only that known
+Router wrapper and fails closed if its layout changes. Cancellation explicitly
+closes the acquired source even if the Router generator has not started, with
+cleanup shielded from the HTTP request's AnyIO cancellation scope. Tests
 exercise the real wrapper, including pre-first-chunk fallback, not just a fake
 stream. This does not patch the global Router or its behavior for other Providers.
 
@@ -100,7 +104,9 @@ them. Raw logprobs and provider-specific fields are not forwarded; completion
 markers and numeric token usage are preserved. Disabling `post_call` explicitly
 disables this Output protection, as for non-streaming requests.
 
-The image build runs `tests/test_streaming.py` against the pinned LiteLLM runtime.
+The image build runs every `tests/test_*.py` against the pinned LiteLLM runtime.
+The release workflow also runs the real PostgreSQL lifecycle and pinned Guard
+integration suite described in [testing](../../docs/testing.md).
 These isolated tests use a real loopback WebSocket peer to exercise adapter contracts;
 the Guard repository's `scripts/regress_business_proxy.mjs` additionally runs a
 real Relay container against real Guard/NeMo and a controlled business model,

@@ -1,5 +1,6 @@
 """Release only text approved by Guard's ordered, pinned output stream API."""
 import asyncio
+import anyio
 import time
 from typing import Any, AsyncGenerator
 from uuid import uuid4
@@ -57,7 +58,7 @@ def _empty_choice(choice: Any) -> bool:
 def _verified_completion(response: Any, depth: int = 0) -> bool:
     """Distinguish upstream completion from LiteLLM's synthetic EOF stop.
 
-    Pinned LiteLLM 1.87's Router wrapper delegates iteration without updating
+    Pinned LiteLLM 1.106.4's Router wrapper delegates iteration without updating
     its inherited completion fields. Its active source is held by the suspended
     stream_with_fallbacks generator, not exposed as a public attribute. Inspect
     that narrowly identified wrapper while it is yielding the terminal frame;
@@ -67,6 +68,10 @@ def _verified_completion(response: Any, depth: int = 0) -> bool:
     if depth > 4:
         return False
     cls = type(response)
+    # 1.106.4 wraps callback inputs in this transparent exception boundary.
+    if cls.__module__ == "litellm.proxy.utils" and cls.__name__ == "_UpstreamStreamBoundary":
+        source = getattr(response, "_source", None)
+        return source is not None and source is not response and _verified_completion(source, depth + 1)
     if cls.__module__ == "litellm.router" and cls.__name__ == "FallbackStreamWrapper":
         generator = getattr(response, "_async_generator", None)
         generator_frame = getattr(generator, "ag_frame", None)
@@ -92,10 +97,11 @@ async def protected_output_stream(provider, response, request_data, user_api_key
     finally:
         # Also covers setup failures, disabled post-call protection, and client
         # cancellation while the inner generator is suspended at a yield.
-        try:
-            await stream.aclose()
-        finally:
-            await _close(response)
+        with anyio.CancelScope(shield=True):
+            try:
+                await stream.aclose()
+            finally:
+                await _close(response)
 
 
 async def _protected_output_stream(provider, response, request_data, user_api_key_dict) -> AsyncGenerator[Any, None]:
@@ -302,8 +308,9 @@ async def _protected_output_stream(provider, response, request_data, user_api_ke
                 for task in (producer, receiver):
                     if task is not None:
                         task.cancel()
-                await asyncio.gather(*(t for t in (producer, receiver) if t is not None), return_exceptions=True)
-                await _close(socket)
+                with anyio.CancelScope(shield=True):
+                    await asyncio.gather(*(t for t in (producer, receiver) if t is not None), return_exceptions=True)
+                    await _close(socket)
     except GuardrailRaisedException:
         outcome = "guardrail_intervened"
         raise
@@ -324,7 +331,23 @@ async def _protected_output_stream(provider, response, request_data, user_api_ke
         )
 
 
-async def _close(response):
+async def _close(response, depth=0):
+    if depth > 4:
+        return
+    cls = type(response)
+    if cls.__module__ == "litellm.proxy.utils" and cls.__name__ == "_UpstreamStreamBoundary":
+        await _close(response._source, depth + 1)
+        return
+    if cls.__module__ == "litellm.router" and cls.__name__ == "FallbackStreamWrapper":
+        generator = getattr(response, "_async_generator", None)
+        frame = getattr(generator, "ag_frame", None)
+        if frame is not None and frame.f_code.co_name == "stream_with_fallbacks":
+            # aclose() on a never-started generator skips its finally block.
+            # Close the acquired model connection even before the first read.
+            for name in ("fallback_response", "model_response"):
+                source = frame.f_locals.get(name)
+                if source is not None and source is not response:
+                    await _close(source, depth + 1)
     close = getattr(response, "aclose", None) or getattr(response, "close", None)
     if close is not None:
         try:

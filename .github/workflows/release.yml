@@ -28,8 +28,12 @@ jobs:
       - id: tag
         run: bash scripts/check-release-tag.sh "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
 
-  publish-platforms:
+  verify:
     needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  publish-platforms:
+    needs: [validate, verify]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -97,5 +101,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" --generate-notes \
             --notes "Image: \`ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/tali-litellm:${{ needs.validate.outputs.image_tag }}\` (LiteLLM ${{ needs.validate.outputs.litellm_version }}, TaskLattice Guard output-stream protocol 1)."

@@ -19,22 +19,22 @@ def forbid(source: str, needle: str, label: str) -> None:
 
 
 def verify_files(app_root: Path) -> None:
-    components = app_root / "ui/litellm-dashboard/src/components"
-    add_form = (components / "guardrails/add_guardrail_form.tsx").read_text(
+    components = app_root / "ui/litellm-dashboard/src/app/(dashboard)/guardrails/_components"
+    add_form = (components / "add_guardrail_form.tsx").read_text(
         encoding="utf-8"
     )
-    info_view = (components / "guardrails/guardrail_info.tsx").read_text(
+    info_view = (components / "guardrail_info.tsx").read_text(
         encoding="utf-8"
     )
     provider_fields = (
-        components / "guardrails/guardrail_provider_fields.tsx"
+        components / "guardrail_provider_fields.tsx"
     ).read_text(encoding="utf-8")
     garden_data = (
-        components / "guardrails/guardrail_garden_data.ts"
+        components / "guardrail_garden_data.ts"
     ).read_text(encoding="utf-8")
 
     require(add_form, "<GuardrailProviderFields", "native create provider fields")
-    require(add_form, 'fieldsToValidate.push("api_base", "api_key")', "create validation")
+    require(add_form, "await form.trigger()", "create validation")
     require(add_form, "createTaskLatticeGuardCall", "secure create submission")
     require(info_view, "<GuardrailProviderFields", "native edit provider fields")
     require(info_view, 'optionalFields={', "optional secret rotation")
@@ -119,10 +119,12 @@ def verify_schema(app_root: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path("/app"))
+    parser.add_argument("--files-only", action="store_true")
     args = parser.parse_args()
     app_root = args.root.resolve()
     verify_files(app_root)
-    verify_schema(app_root)
+    if not args.files_only:
+        verify_schema(app_root)
     print("Verified TaskLattice native Guardrail integration")
 
 
