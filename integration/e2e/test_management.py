@@ -31,6 +31,7 @@ async def test_management_api_and_encrypted_persistence(tmp_path):
     # Only synthetic data is accepted; this is a connection-verification peer.
     peer_script = '''
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_POST(self):
