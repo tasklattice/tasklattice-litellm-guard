@@ -1,0 +1,6 @@
+{
+  "version": "0.3.12",
+  "revision": "2e95e8a3eef2933c023a5a5688c12b14bef57cc9",
+  "controller_image": "ghcr.io/tasklattice/tali-guard-controller:0.3.12@sha256:d49a4d94b73e4c48a2e54479fb309898e544443164006b0102ae1db0d622b5f9",
+  "runner_image": "ghcr.io/tasklattice/tali-guard-runner:0.3.12@sha256:de4631bfbc6d87113ff8aa6f355ae8b18a36b59ecc7fd2ac452eccc32f5f9c0a"
+}

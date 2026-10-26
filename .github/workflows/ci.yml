@@ -42,11 +42,21 @@ jobs:
           tags: tali-litellm:ci
           cache-from: type=gha,scope=builder-${{ matrix.litellm }}
           cache-to: type=gha,mode=max,scope=builder-${{ matrix.litellm }}
-      - name: Check out pinned Guard integration suite
+      - name: Read pinned Guard release
+        id: guard
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
+          import json
+          with open("integration/guard-version.json") as stream:
+              release = json.load(stream)
+          print("revision=" + release["revision"])
+          print("version=" + release["version"])
+          PYTHON
+      - name: Check out Guard v${{ steps.guard.outputs.version }} integration suite
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tasklattice/tasklattice-guard
-          ref: 2e95e8a3eef2933c023a5a5688c12b14bef57cc9
+          ref: ${{ steps.guard.outputs.revision }}
           path: .guard-integration
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -54,7 +64,7 @@ jobs:
       - name: Install Guard test runtime
         working-directory: .guard-integration
         run: uv sync --all-extras --frozen
-      - name: Real Guard Runner and NeMo integration
+      - name: Real Guard CLI, Controller, Runner and NeMo integration
         env:
           GUARD_CHECKOUT: ${{ github.workspace }}/.guard-integration
           GUARD_TEST_RELAY_IMAGE: tali-litellm:ci

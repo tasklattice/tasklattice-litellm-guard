@@ -1,152 +1,139 @@
-"""Real management API and encrypted persistence on an isolated PostgreSQL.
-
-The verification peer is controlled; actual Runner/NeMo is tested separately.
-All credentials here are generated test values and all containers are removed.
-"""
+"""CLI-provisioned Guard v0.3.12 -> LiteLLM management, persistence and inference."""
 import asyncio
-import os
+import json
 from uuid import uuid4
 
 import httpx
 import pytest
 
+BLOCKED = 'RELEASE_FORBIDDEN_MARKER'
+SAFE = 'A safe release verification answer.'
 
-async def docker(*args, timeout=60):
-    process = await asyncio.create_subprocess_exec('docker', *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout)
-    assert process.returncode == 0, f'Docker {args[0]} failed (arguments and output omitted)'
-    return stdout.decode().strip()
+
+async def assert_protection(client, stack):
+    async def complete(model='release-safe', text='A harmless question.', stream=False):
+        return await client.post('/v1/chat/completions', json={
+            'model': model, 'messages': [{'role': 'user', 'content': text}], 'stream': stream})
+
+    safe = await complete()
+    assert safe.status_code == 200
+    assert safe.json()['choices'][0]['message']['content'] == SAFE
+    async with httpx.AsyncClient(base_url=stack.model_url, trust_env=False) as model:
+        before = (await model.get('/stats')).json()['calls']
+        blocked = await complete(text=BLOCKED)
+        assert 400 <= blocked.status_code < 500
+        assert (await model.get('/stats')).json()['calls'] == before, 'Input block must precede the model call'
+    blocked = await complete(model='release-blocked')
+    assert 400 <= blocked.status_code < 500
+    for name in ['release-safe', 'release-blocked']:
+        response = await complete(model=name, stream=True)
+        events = [json.loads(line[6:]) for line in response.text.splitlines()
+                  if line.startswith('data: ') and line != 'data: [DONE]']
+        text, finishes, errors = '', [], []
+        for event in events:
+            if event.get('error'):
+                errors.append(event['error'])
+            for choice in event.get('choices', []):
+                text += choice.get('delta', {}).get('content') or ''
+                if choice.get('finish_reason'):
+                    finishes.append(choice['finish_reason'])
+        if name == 'release-safe':
+            assert response.status_code == 200 and text == SAFE
+            assert finishes == ['stop'] and not errors
+        else:
+            assert text == '' and not finishes
+            assert errors or 400 <= response.status_code < 500
+            assert BLOCKED not in response.text
 
 
 @pytest.mark.asyncio
-async def test_management_api_and_encrypted_persistence(tmp_path):
-    image = os.environ['GUARD_TEST_RELAY_IMAGE']
-    prefix = 'guard-release-' + uuid4().hex[:10]
-    database, peer, proxy = [prefix + '-' + name for name in ['db', 'peer', 'proxy']]
-    master, secret = 'sk-test-' + uuid4().hex, 'test-' + uuid4().hex
-    config = tmp_path / 'litellm.yaml'
-    config.write_text('model_list: []\nlitellm_settings:\n  telemetry: false\ngeneral_settings:\n  store_model_in_db: true\n  master_key: os.environ/LITELLM_MASTER_KEY\n')
-    config.chmod(0o644)
-    # Only synthetic data is accepted; this is a connection-verification peer.
-    peer_script = '''
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import json
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args): pass
-    def do_POST(self):
-        self.rfile.read(int(self.headers.get('content-length', 0)))
-        self.send_response(401 if self.headers.get('x-api-key') == 'wrong' else 200)
-        self.send_header('Content-Type', 'application/json'); self.end_headers()
-        self.wfile.write(json.dumps({'ready': True, 'adapter_id': 'litellm-generic-guardrail', 'protocol': 'litellm'}).encode())
-HTTPServer(('0.0.0.0', 5001), Handler).serve_forever()
-'''
-    containers = []
-    await docker('network', 'create', prefix)
-    try:
-        await docker('run', '-d', '--name', database, '--network', prefix,
-            '-e', 'POSTGRES_PASSWORD=synthetic-db-password', '-e', 'POSTGRES_DB=litellm',
-            'postgres:17-alpine', timeout=180)
-        containers.append(database)
-        async with asyncio.timeout(45):
-            while True:
-                try:
-                    await docker('exec', database, 'pg_isready', '-U', 'postgres')
-                    break
-                except AssertionError:
-                    await asyncio.sleep(.5)
-        await docker('run', '-d', '--pull=never', '--name', peer, '--network', prefix,
-            '--entrypoint', 'python', image, '-c', peer_script)
-        containers.append(peer)
-        # Runtime startup can race an otherwise healthy verification peer on CI.
-        async with asyncio.timeout(30):
-            while True:
-                try:
-                    await docker('exec', peer, 'python', '-c',
-                        "import socket; socket.create_connection(('127.0.0.1', 5001), timeout=1).close()")
-                    break
-                except AssertionError:
-                    assert await docker('inspect', peer, '--format', '{{.State.Running}}') == 'true'
-                    await asyncio.sleep(.2)
-        await docker('run', '-d', '--pull=never', '--name', proxy, '--network', prefix,
-            '-p', '127.0.0.1::4000', '-v', f'{config}:/tmp/config.yaml:ro',
-            '-e', f'LITELLM_MASTER_KEY={master}', '-e', 'LITELLM_SALT_KEY=synthetic-salt',
-            '-e', f'DATABASE_URL=postgresql://postgres:synthetic-db-password@{database}:5432/litellm',
-            '-e', 'STORE_MODEL_IN_DB=True', '-e', 'LITELLM_MIGRATION_DIR=/tmp/migrations',
-            image, '--config', '/tmp/config.yaml', '--port', '4000', '--use_v2_migration_resolver')
-        containers.append(proxy)
-        address = await docker('port', proxy, '4000/tcp')
-        assert address.startswith('127.0.0.1:') and '\n' not in address
-        async with httpx.AsyncClient(base_url='http://' + address,
-                headers={'Authorization': 'Bearer ' + master}, timeout=15, trust_env=False) as client:
-            async with asyncio.timeout(180):
-                while True:
-                    try:
-                        if (await client.get('/health/readiness')).status_code == 200:
-                            break
-                    except httpx.TransportError:
-                        pass
-                    assert await docker('inspect', proxy, '--format', '{{.State.Running}}') == 'true'
-                    await asyncio.sleep(1)
-            assert (await client.get('/ui/')).status_code == 200
-            endpoint = f'http://{peer}:5001/runtime/v1/endpoints/{uuid4()}'
-            payload = {'guardrail_name': 'Release lifecycle', 'endpoint': endpoint,
-                       'secret': secret, 'default_on': False}
-            # Failed verification must not persist anything.
-            failed = await client.post('/guardrails/tasklattice', json={**payload, 'secret': 'wrong'})
-            assert failed.status_code == 400
-            response = await client.post('/guardrails/tasklattice', json=payload)
-            assert response.status_code == 200, response.text.replace(secret, '[redacted]')
-            value = response.json()
-            guardrail_id = value['guardrail_id']
-            assert value['credential_configured'] and secret not in response.text
-            path = '/guardrails/tasklattice/' + guardrail_id
-            read = await client.get(path)
-            assert read.status_code == 200 and secret not in read.text
+async def test_management_api_and_encrypted_persistence(guard_stack):
+    stack = guard_stack
+    # A repeat of the exact CLI operation must reuse the published resources.
+    resumed = await stack.cli()
+    assert resumed == stack.provision
+    async with httpx.AsyncClient(base_url=stack.proxy_url,
+            headers={'Authorization': 'Bearer ' + stack.master}, timeout=15, trust_env=False) as client:
+        assert (await client.get('/ui/')).status_code == 200
+        endpoint = stack.endpoint
+        secret = stack.credential
+        payload = {'guardrail_name': 'Release lifecycle', 'endpoint': endpoint,
+                   'secret': secret, 'default_on': True}
+        # Failed verification must not persist anything.
+        failed = await client.post('/guardrails/tasklattice', json={**payload, 'secret': 'wrong'})
+        assert failed.status_code == 400
+        response = await client.post('/guardrails/tasklattice', json=payload)
+        assert response.status_code == 200, response.text.replace(secret, '[redacted]')
+        value = response.json()
+        guardrail_id = value['guardrail_id']
+        assert value['credential_configured'] and secret not in response.text
+        path = '/guardrails/tasklattice/' + guardrail_id
+        read = await client.get(path)
+        assert read.status_code == 200 and secret not in read.text
 
-            async def stored_credentials():
-                return await docker('exec', database, 'psql', '-U', 'postgres', '-d', 'litellm', '-Atc',
-                    'SELECT credential_values::text FROM "LiteLLM_CredentialsTable"')
-            before = await stored_credentials()
-            assert before and secret not in before
-            generic = await client.post('/guardrails', json={'guardrail': {'guardrail_name': 'Bypass',
-                'litellm_params': {'guardrail': 'tasklattice_guard', 'mode': ['pre_call'],
-                                  'api_base': endpoint, 'api_key': secret}}})
+        async def stored_credentials():
+            return await stack.docker('exec', stack.database, 'psql', '-U', 'postgres', '-d', 'litellm', '-Atc',
+                'SELECT credential_values::text FROM "LiteLLM_CredentialsTable"')
+        before = await stored_credentials()
+        assert before and secret not in before
+        generic = await client.post('/guardrails', json={'guardrail': {'guardrail_name': 'Bypass',
+            'litellm_params': {'guardrail': 'tasklattice_guard', 'mode': ['pre_call'],
+                              'api_base': endpoint, 'api_key': secret}}})
+        assert generic.status_code == 400
+        replacement = {'guardrail': {'guardrail_name': 'Bypass', 'litellm_params': {
+            'guardrail': 'tasklattice_guard', 'mode': ['pre_call'], 'api_key': secret}}}
+        for method, body in [('PUT', replacement), ('PATCH', {'litellm_params': {'api_key': secret}})]:
+            generic = await client.request(method, '/guardrails/' + guardrail_id, json=body)
             assert generic.status_code == 400
-            replacement = {'guardrail': {'guardrail_name': 'Bypass', 'litellm_params': {
-                'guardrail': 'tasklattice_guard', 'mode': ['pre_call'], 'api_key': secret}}}
-            for method, body in [('PUT', replacement), ('PATCH', {'litellm_params': {'api_key': secret}})]:
-                generic = await client.request(method, '/guardrails/' + guardrail_id, json=body)
-                assert generic.status_code == 400
-            updated = await client.patch(path, json={'mode': ['pre_call'], 'timeout_seconds': 3})
-            assert updated.status_code == 200 and updated.json()['timeout_seconds'] == 3
-            assert await stored_credentials() == before
-            changed_endpoint = endpoint.rsplit('/', 1)[0] + '/' + str(uuid4())
-            assert (await client.patch(path, json={'endpoint': changed_endpoint})).status_code == 400
-            assert (await client.patch(path, json={'secret': 'wrong'})).status_code == 400
-            assert await stored_credentials() == before
-            rotated = 'rotated-' + uuid4().hex
-            assert (await client.patch(path, json={'secret': rotated})).status_code == 200
-            after = await stored_credentials()
-            assert after != before and rotated not in after
-            # Ordinary LiteLLM deletion must invoke Provider credential cleanup.
-            assert (await client.delete('/guardrails/' + guardrail_id)).status_code == 200
-            assert (await client.get(path)).status_code == 404
-            assert await stored_credentials() == ''
-            # Also exercise the dedicated deletion route.
-            response = await client.post('/guardrails/tasklattice', json=payload)
-            assert response.status_code == 200
-            assert (await client.delete('/guardrails/tasklattice/' + response.json()['guardrail_id'])).status_code == 204
-            assert await stored_credentials() == ''
-    except Exception:
-        for container in containers:
-            process = await asyncio.create_subprocess_exec('docker', 'logs', '--tail', '60', container,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-            output, _ = await asyncio.wait_for(process.communicate(), 15)
-            text = output.decode().replace(master, '[redacted]').replace(secret, '[redacted]')
-            print(f'{container}:\n{text[-6000:]}')
-        raise
-    finally:
-        for container in reversed(containers):
-            await docker('rm', '-f', '-v', container)
-        await docker('network', 'rm', prefix)
+        await assert_protection(client, stack)
+        updated = await client.patch(path, json={'mode': ['pre_call'], 'timeout_seconds': 3})
+        assert updated.status_code == 200 and updated.json()['timeout_seconds'] == 3
+        assert await stored_credentials() == before
+        changed_endpoint = endpoint.rsplit('/', 1)[0] + '/' + str(uuid4())
+        assert (await client.patch(path, json={'endpoint': changed_endpoint})).status_code == 400
+        assert (await client.patch(path, json={'secret': 'wrong'})).status_code == 400
+        assert await stored_credentials() == before
+        async with httpx.AsyncClient(base_url=stack.controller_url,
+                headers={'Origin': stack.origin}, timeout=30, trust_env=False) as control:
+            login = await control.post('/api/auth/sign-in/email', json={
+                'email': 'tenant@example.test', 'password': stack.password})
+            assert login.status_code == 200
+            rotation = await control.post('/api/v1/endpoints/' + stack.provision['endpointId'] + '/credentials')
+            assert rotation.status_code == 201
+            rotated = rotation.json()['credential']
+            stack.secrets.append(rotated)
+            revoked = await control.delete('/api/v1/endpoints/' + stack.provision['endpointId']
+                + '/credentials/' + stack.credential_id)
+            assert revoked.status_code == 204
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as runtime:
+            async with asyncio.timeout(30):
+                while True:
+                    verified = await runtime.post(stack.runner_url + stack.endpoint_path + '/verify',
+                        headers={'x-api-key': rotated}, json={})
+                    stale = await runtime.post(stack.runner_url + stack.endpoint_path + '/verify',
+                        headers={'x-api-key': secret}, json={})
+                    if verified.status_code == 200 and stale.status_code in [401, 403]:
+                        break
+                    await asyncio.sleep(.2)
+        # Prove the old credential no longer authorizes model traffic.
+        async with httpx.AsyncClient(base_url=stack.model_url, trust_env=False) as model:
+            calls_before = (await model.get('/stats')).json()['calls']
+            denied = await client.post('/v1/chat/completions', json={
+                'model': 'release-safe', 'messages': [{'role': 'user', 'content': 'Safe question.'}]})
+            assert denied.status_code >= 400
+            assert (await model.get('/stats')).json()['calls'] == calls_before
+        assert (await client.patch(path, json={'secret': rotated})).status_code == 200
+        after = await stored_credentials()
+        assert after != before and rotated not in after
+        assert (await client.patch(path, json={'mode': ['pre_call', 'post_call'], 'timeout_seconds': 10})).status_code == 200
+        await assert_protection(client, stack)
+        # Ordinary LiteLLM deletion must invoke Provider credential cleanup.
+        assert (await client.delete('/guardrails/' + guardrail_id)).status_code == 200
+        assert (await client.get(path)).status_code == 404
+        assert await stored_credentials() == ''
+        # Also exercise the dedicated deletion route.
+        payload['secret'] = rotated
+        response = await client.post('/guardrails/tasklattice', json=payload)
+        assert response.status_code == 200
+        assert (await client.delete('/guardrails/tasklattice/' + response.json()['guardrail_id'])).status_code == 204
+        assert await stored_credentials() == ''

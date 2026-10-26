@@ -3,7 +3,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${GUARD_CHECKOUT:?Set GUARD_CHECKOUT to the pinned TaskLattice Guard checkout}"
 : "${GUARD_TEST_RELAY_IMAGE:?Set GUARD_TEST_RELAY_IMAGE to the built image}"
-expected_revision=2e95e8a3eef2933c023a5a5688c12b14bef57cc9
+expected_revision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision"])' "$repository_root/integration/guard-version.json")"
 actual_revision="$(git -C "$GUARD_CHECKOUT" rev-parse HEAD)"
 if [[ "$actual_revision" != "$expected_revision" ]] || [[ -n "$(git -C "$GUARD_CHECKOUT" status --porcelain --untracked-files=no)" ]]; then
   echo "Guard integration requires clean revision $expected_revision" >&2

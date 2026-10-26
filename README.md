@@ -49,6 +49,11 @@ docker build --target tasklattice-litellm-builder .
 
 The first build recompiles the LiteLLM dashboard and takes several minutes.
 
+The release gate additionally uses pinned **Tali Guard v0.3.12** Controller and
+Runner images. It creates a real Guardrail with the shipped `guardctl`, then
+checks LiteLLM inference and credential lifecycle through its live Endpoint.
+See [test coverage and local reproduction](docs/testing.md).
+
 ## Release
 
 Push a tag `v<litellm-version>-guard.<n>` from `main`:
