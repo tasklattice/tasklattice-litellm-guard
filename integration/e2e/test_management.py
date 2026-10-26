@@ -57,6 +57,16 @@ HTTPServer(('0.0.0.0', 5001), Handler).serve_forever()
         await docker('run', '-d', '--pull=never', '--name', peer, '--network', prefix,
             '--entrypoint', 'python', image, '-c', peer_script)
         containers.append(peer)
+        # Runtime startup can race an otherwise healthy verification peer on CI.
+        async with asyncio.timeout(30):
+            while True:
+                try:
+                    await docker('exec', peer, 'python', '-c',
+                        "import socket; socket.create_connection(('127.0.0.1', 5001), timeout=1).close()")
+                    break
+                except AssertionError:
+                    assert await docker('inspect', peer, '--format', '{{.State.Running}}') == 'true'
+                    await asyncio.sleep(.2)
         await docker('run', '-d', '--pull=never', '--name', proxy, '--network', prefix,
             '-p', '127.0.0.1::4000', '-v', f'{config}:/tmp/config.yaml:ro',
             '-e', f'LITELLM_MASTER_KEY={master}', '-e', 'LITELLM_SALT_KEY=synthetic-salt',
@@ -85,7 +95,7 @@ HTTPServer(('0.0.0.0', 5001), Handler).serve_forever()
             failed = await client.post('/guardrails/tasklattice', json={**payload, 'secret': 'wrong'})
             assert failed.status_code == 400
             response = await client.post('/guardrails/tasklattice', json=payload)
-            assert response.status_code == 200
+            assert response.status_code == 200, response.text.replace(secret, '[redacted]')
             value = response.json()
             guardrail_id = value['guardrail_id']
             assert value['credential_configured'] and secret not in response.text
@@ -127,6 +137,14 @@ HTTPServer(('0.0.0.0', 5001), Handler).serve_forever()
             assert response.status_code == 200
             assert (await client.delete('/guardrails/tasklattice/' + response.json()['guardrail_id'])).status_code == 204
             assert await stored_credentials() == ''
+    except Exception:
+        for container in containers:
+            process = await asyncio.create_subprocess_exec('docker', 'logs', '--tail', '60', container,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            output, _ = await asyncio.wait_for(process.communicate(), 15)
+            text = output.decode().replace(master, '[redacted]').replace(secret, '[redacted]')
+            print(f'{container}:\n{text[-6000:]}')
+        raise
     finally:
         for container in reversed(containers):
             await docker('rm', '-f', '-v', container)
